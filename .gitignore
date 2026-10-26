@@ -58,3 +58,4 @@ experiments/update_paper_full.py
 Thumbs.db
 .gemini/
 scratch/
+tmp/
