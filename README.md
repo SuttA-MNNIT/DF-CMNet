@@ -1,148 +1,93 @@
-# DF-CMNet: Dual-Domain Frequency-Spatial Cross-Modulation Network for Passive Image Forgery Localization
+# DF-CMNet v2: Dual-Domain Frequency-Spatial Cross-Modulation Network with Boundary-Aware Supervision for Robust Passive Image Forgery Localization
 
-An open-source PyTorch implementation of **DF-CMNet**, an end-to-end deep learning framework designed for passive (blind) image forgery detection and pixel-level localization across various manipulation types (splicing, copy-move cloning, and generative inpainting).
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](Implementation/LICENSE)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/Release-v2.0-orange.svg)](https://github.com/SuttA-MNNIT/DF-CMNet/releases/tag/v2.0)
+
+This repository contains the complete official PyTorch codebase, evaluation benchmarks, and pre-trained weights for **DF-CMNet v2**, an end-to-end dual-domain deep forensic framework designed for passive image forgery localization across splicing, copy-move cloning, and generative diffusion inpainting.
 
 ---
 
-## 🌟 Key Architecture & Highlights
+## 📁 Repository Organization
 
-DF-CMNet resolves structural bottlenecks in passive image forensics (such as semantic edge bias, cross-domain decoupling, and vanishing gradients on authentic images) through a coordinated dual-stream design:
+The repository is organized under `Implementation/`:
+
+```
+DF-CMNet/
+└── Implementation/        # Full PyTorch source code, models, and benchmarks
+    ├── models/            # Architecture definitions (LHFRE, DACM, BARGM, DF-CMNet v2)
+    ├── losses/            # Compound objective with Authentic Suppression Penalty (ASP)
+    ├── dataset/           # Standard benchmark loaders & on-the-fly synthetic generator
+    ├── experiments/       # Evaluation suites, qualitative generators, robustness tests
+    ├── checkpoints/       # Trained model weights (best_model.pth)
+    ├── results/           # Benchmark metrics (JSON), heatmaps, and overlays
+    ├── demo/              # Sample query images & forensic localization masks
+    ├── train.py           # Training and validation pipeline
+    ├── infer.py           # Inference script with visual forensic artifact generation
+    ├── verify_model.py    # Unit tests, gradient flow checks, and FLOP verification
+    ├── verify_results.py  # Automated metric and benchmark claim auditor
+    ├── requirements.txt   # Python dependencies
+    └── README.md          # Detailed implementation documentation and quick start guide
+```
+
+---
+
+## 🌟 Key Highlights & Architectural Innovations
 
 1. **Learnable High-Frequency Residual Extractor (LHFRE):**
-   - Integrates Bayar constrained convolution kernels to suppress semantic content and extract low-level sensor noise footprints (PRNU, demosaicing artifacts).
-   - Decomposes residuals into directional frequency sub-bands ($LH, HL, HH$) via multi-scale 2D Discrete Wavelet Transform (2D-DWT).
+   - Pairs a $5 \times 5$ Bayar-constrained prediction-error convolution with affine instance standardization to eliminate camera ISO and exposure variance.
+   - Applies lossless orthonormal 2D Haar Discrete Wavelet Transform (2D-DWT) decomposition into directional sub-bands ($LL, LH, HL, HH$) without spatial aliasing.
 
-2. **Cross-Domain Bidirectional Modulation (CDBM / DACM):**
-   - Coordinates reciprocal spatial and channel cross-attention between spatial representations and spectral sub-bands.
-   - Selectively recalibrates spatial representations using high-frequency anomaly cues and vice versa.
+2. **Dual-Attention Cross-Domain Modulation (DACM):**
+   - Performs reciprocal point-wise spatial cross-attention to identify spatial-spectral coincidence at manipulation seams.
+   - Executes global channel cross-attention with strictly linear $\mathcal{O}(H_l W_l d_k)$ complexity, avoiding quadratic transformer attention overhead.
 
 3. **Boundary-Aware Residual Guidance Module (BARGM):**
-   - Employs Atrous Spatial Pyramid Pooling (ASPP) to capture multi-scale context along subtle donor-host transition seams.
-   - Enforces sharp localization along blended or feathered manipulation margins.
+   - Combines multi-rate dilated context ($r \in \{1, 2, 4\}$) with high-resolution Stage-1 skip refinement.
+   - Enforces joint BCE + Soft-IoU morphological edge supervision against ground-truth seams ($B_{\text{gt}}$), reducing contour Hausdorff distance to $2.14$ px.
 
-4. **Compound Multi-Task Objective with Authentic Suppression Penalty (ASP):**
-   - Jointly optimizes Focal Loss, Soft Dice Loss, and morphological boundary supervision.
-   - Integrates an authentic suppression penalty that completely prevents zero-gradient pathologies on negative pristine imagery.
-
----
-
-## 📁 Repository Structure
-
-```
-├── models/                      # Deep learning architecture
-│   ├── __init__.py
-│   ├── bayar_conv.py            # Bayar constrained convolution (noise residual extraction)
-│   ├── wavelet_dwt.py           # 2D Haar Discrete Wavelet Transform (sub-band decomposition)
-│   ├── cdbm.py                  # Cross-Domain Bidirectional Modulation (reciprocal attention)
-│   ├── bargm.py                 # Boundary-Aware Residual Guidance Module (ASPP edge head)
-│   └── df_cmnet.py              # Full DF-CMNet pipeline & progressive multi-scale decoder
-│
-├── losses/                      # Loss formulations
-│   ├── __init__.py
-│   └── compound_loss.py         # Multi-task loss: Focal Loss + Dice Loss + Morphological Boundary BCE
-│
-├── dataset/                     # Data loading & augmentation
-│   ├── __init__.py
-│   ├── forgery_dataset.py       # Benchmark loader (CASIA, Columbia, NIST'16, COVERAGE)
-│   └── synthetic_tamper.py      # On-the-fly synthetic tamper generator for out-of-the-box training
-│
-├── experiments/                 # Comprehensive evaluation & visualization suite
-│   ├── benchmark_suite.py       # Multi-benchmark stress testing & ablation suite
-│   ├── generate_qualitative_suite.py # Qualitative comparative visual generator
-│   └── generate_robustness_visuals.py # Robustness analysis under noise, blur, & compression
-│
-├── checkpoints/                 # Pretrained weights
-│   ├── best_model.pth           # Trained model weights (F1: 0.851, AUC: 0.934)
-│   └── best_model_60epochs.pth  # 60-epoch convergence checkpoint
-│
-├── demo/                        # Sample test imagery & ground-truth masks
-├── results/                     # Benchmark artifacts, metric logs, & forensic heatmaps
-├── verify_model.py              # Unit tests, gradient flow checks, and throughput benchmarking
-├── train.py                     # Standard training & evaluation pipeline (F1, AUC, IoU)
-├── train_60_epochs.py           # Extended training pipeline with fast metric evaluations
-├── infer.py                     # Inference script producing heatmaps, masks, and boundary overlays
-├── requirements.txt             # Environment dependencies
-├── LICENSE                      # MIT License
-└── README.md                    # Project documentation
-```
+4. **Regime-Decoupled Authentic Suppression Penalty (ASP):**
+   - Eliminates the $\epsilon$-vanishing gradient pathology of standard Dice and Soft-IoU losses on pristine authentic images ($Y = \mathbf{0}$).
+   - Restores linear restoring backpropagation gradients, reducing pristine false-positive rates to $0.41\%$.
 
 ---
 
-## 🔧 Installation & Requirements
+## 📊 Benchmark Summary
 
-### 1. Clone the Repository
-```bash
-git clone https://github.com/SuttA-MNNIT/DF-CMNet.git
-cd DF-CMNet
-```
+DF-CMNet v2 sets state-of-the-art localization performance across standard benchmarks and generative inpainting suites:
 
-### 2. Install Dependencies
-Ensure Python 3.9+ and PyTorch 2.0+ are installed:
+| Benchmark Dataset | Manipulation Type | Images Tested | $F_1$ Score (%) | AUC (%) |
+| :--- | :--- | :---: | :---: | :---: |
+| **CASIA v2.0** | Splicing & Copy-Move | 1,261 | **85.1** | **93.4** |
+| **Columbia** | Uncompressed Splicing | 180 | **92.4** | **96.8** |
+| **NIST'16** | Complex Blended Forgeries | 564 | **79.6** | **89.5** |
+| **COVERAGE** | Copy-Move Cloning | 100 | **78.2** | **87.9** |
+| **CASIA v1.0** | Splicing & Copy-Move | 921 | **83.7** | **91.8** |
+| **IMD2020** | Real-World Web Manipulations | 2,010 | **76.5** | **86.7** |
+| **CocoGlide** | Latent Diffusion Inpainting | 512 | **81.4** | **90.2** |
+| **AutoSplice** | Generative Text-to-Image / Inpaint | 1,288 | **80.8** | **89.6** |
+| **DEFACTO-LaMa** | Fast Fourier Inpainting Removal | 990 | **82.3** | **91.1** |
+
+*Efficiency:* Runs at **68.5 FPS** on an NVIDIA RTX 4090 GPU ($512 \times 512$) with only **5.24M parameters** and **19.28 GFLOPs**.
+
+---
+
+## 🚀 Getting Started
+
+To explore the code, train models, or run inference, navigate to the `Implementation/` directory:
+
 ```bash
+cd Implementation
 pip install -r requirements.txt
-```
-
----
-
-## 🚀 Quick Start Guide
-
-### 1. Verify Architecture & Gradient Flow
-Run the automated verification suite to test forward pass, backward pass, gradient propagation across both spatial and frequency streams, parameter count, and inference throughput:
-
-```bash
 python verify_model.py
+python infer.py --image_path demo/case_splicing_query.png --checkpoint checkpoints/best_model.pth
 ```
 
-### 2. Run Inference & Tampering Localization
-Localize tampering on any test image and generate visual forensic artifacts (probability heatmaps, binary masks, boundary maps, and overlaid masks):
-
-```bash
-python infer.py --image_path demo/case_splicing_query.png --checkpoint checkpoints/best_model.pth --img_size 256
-```
-
-If no `--image_path` is specified, the script automatically synthesizes a demo tampered image and performs localization.
-
-**Generated Forensic Artifacts (saved in `results/`):**
-- `*_prob_heatmap.png`: Continuous tampering confidence heatmap $[0, 1]$.
-- `*_binary_mask.png`: Binarized tampering decision mask.
-- `*_boundary_map.png`: Localized boundary transition seams.
-- `*_overlay.png`: Visual forensic heatmap blended over the original image.
-
----
-
-## 🏋️ Training DF-CMNet
-
-### Train on Synthetic Tampering Data (Out-of-the-Box)
-You can train immediately on synthetic tampering data without downloading external datasets:
-
-```bash
-python train.py --epochs 10 --batch_size 4 --img_size 256
-```
-
-### Train on Benchmark Datasets
-Format your dataset (e.g., CASIA v2.0, Columbia, NIST'16, or COVERAGE) into `images/` and `masks/`:
-
-```bash
-python train.py --data_dir /path/to/dataset --epochs 50 --batch_size 16 --img_size 512
-```
-
----
-
-## 📊 Experimental Evaluation Suite
-
-Run the automated evaluation benchmark suite covering intra-dataset localization, cross-dataset transferability, tamper scale sensitivity, and degradation stress-testing (JPEG re-compression, Gaussian blur, additive noise, geometric transformations):
-
-```bash
-python experiments/benchmark_suite.py
-```
-
-Generate visual forensic comparison plates:
-```bash
-python experiments/generate_qualitative_suite.py
-```
+For full setup, training instructions, and ablation experiments, see [Implementation/README.md](Implementation/README.md).
 
 ---
 
 ## 📜 License
 
-This project is open-source and released under the [MIT License](LICENSE).
+This project is licensed under the MIT License - see the [Implementation/LICENSE](Implementation/LICENSE) file for details.

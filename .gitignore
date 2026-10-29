@@ -12,50 +12,44 @@ env/
 venv/
 ENV/
 
-# Checkpoint full backups
+# Checkpoint full backups (only best_model.pth is tracked in git)
+**/checkpoints/*_full.pth
+**/checkpoints/*60epochs*.pth
+**/checkpoints/latest*.pth
 checkpoints/*_full.pth
 checkpoints/*60epochs*.pth
 checkpoints/latest*.pth
+Implementation/checkpoints/*_full.pth
+Implementation/checkpoints/*60epochs*.pth
+Implementation/checkpoints/latest*.pth
 *.pth.tar
 
-# LaTeX, Manuscript & Submission Files (Strictly Excluded)
-*.tex
-*.tex.bak
-*.cls
-*.sty
-*.bib
-*.bst
+# LaTeX Intermediate Auxiliary Files
 *.aux
 *.bbl
 *.blg
 *.log
 *.out
 *.abs
-*.pdf
-*.zip
-els-cas-templates/
-doc/
-thumbnails/
-figs/
-references.bib
-work_status_checkpoint.md
-exact_clips.txt
-highlighted_text.txt
-manifest.txt
-README
-audit.py
-verify_results.py
-experiments/build_11_page_paper.py
-experiments/update_paper_clean.py
-experiments/update_paper_full.py
+*.toc
+*.synctex.gz
+*.bak
 
-# IDE, OS, & AI agent metadata
+# Temporary and Scratch Directories
+.gemini/
+scratch/
+tmp/
 .idea/
 .vscode/
 *.swp
 *.swo
 .DS_Store
 Thumbs.db
-.gemini/
-scratch/
-tmp/
+
+# Paper Formats and LaTeX Manuscripts (Private / Not for public repo)
+Elsevier_Format/
+IEEE_Format/
+
+# Large archives (keep git repository light)
+*.zip
+*.tar
