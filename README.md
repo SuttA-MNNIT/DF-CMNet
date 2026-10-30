@@ -18,15 +18,17 @@ DF-CMNet/
 └── Implementation/        # Full PyTorch source code, models, and benchmarks
     ├── models/            # Architecture definitions (LHFRE, DACM, BARGM, DF-CMNet v2)
     ├── losses/            # Compound objective with Authentic Suppression Penalty (ASP)
-    ├── dataset/           # Standard benchmark loaders & on-the-fly synthetic generator
+    ├── dataset/           # Real benchmark loaders & on-the-fly synthetic generator
     ├── experiments/       # Evaluation suites, qualitative generators, robustness tests
     ├── checkpoints/       # Trained model weights (best_model.pth)
     ├── results/           # Benchmark metrics (JSON), heatmaps, and overlays
     ├── demo/              # Sample query images & forensic localization masks
-    ├── train.py           # Training and validation pipeline
+    ├── Colab_H100_Runner.ipynb # One-click Master Google Colab H100 execution notebook
+    ├── download_datasets.py # Automated benchmark dataset downloader (Kaggle & mirrors)
+    ├── train.py           # Training and validation pipeline with ablation support (V1..V8)
+    ├── train_60_epochs.py # 60-epoch training entry point
     ├── infer.py           # Inference script with visual forensic artifact generation
     ├── verify_model.py    # Unit tests, gradient flow checks, and FLOP verification
-    ├── verify_results.py  # Automated metric and benchmark claim auditor
     ├── requirements.txt   # Python dependencies
     └── README.md          # Detailed implementation documentation and quick start guide
 ```
@@ -37,7 +39,7 @@ DF-CMNet/
 
 1. **Learnable High-Frequency Residual Extractor (LHFRE):**
    - Pairs a $5 \times 5$ Bayar-constrained prediction-error convolution with affine instance standardization to eliminate camera ISO and exposure variance.
-   - Applies lossless orthonormal 2D Haar Discrete Wavelet Transform (2D-DWT) decomposition into directional sub-bands ($LL, LH, HL, HH$) without spatial aliasing.
+   - Applies orthonormal 2D Haar Discrete Wavelet Transform (2D-DWT) decomposition into directional sub-bands ($LL, LH, HL, HH$) without spatial aliasing.
 
 2. **Dual-Attention Cross-Domain Modulation (DACM):**
    - Performs reciprocal point-wise spatial cross-attention to identify spatial-spectral coincidence at manipulation seams.
@@ -45,37 +47,26 @@ DF-CMNet/
 
 3. **Boundary-Aware Residual Guidance Module (BARGM):**
    - Combines multi-rate dilated context ($r \in \{1, 2, 4\}$) with high-resolution Stage-1 skip refinement.
-   - Enforces joint BCE + Soft-IoU morphological edge supervision against ground-truth seams ($B_{\text{gt}}$), reducing contour Hausdorff distance to $2.14$ px.
+   - Enforces joint BCE + Soft-IoU morphological edge supervision against ground-truth seams ($B_{\text{gt}}$).
 
 4. **Regime-Decoupled Authentic Suppression Penalty (ASP):**
-   - Eliminates the $\epsilon$-vanishing gradient pathology of standard Dice and Soft-IoU losses on pristine authentic images ($Y = \mathbf{0}$).
-   - Restores linear restoring backpropagation gradients, reducing pristine false-positive rates to $0.41\%$.
+   - Eliminates the vanishing gradient pathology of standard overlap losses on pristine authentic images ($Y = \mathbf{0}$).
+   - Restores linear restoring backpropagation gradients on unmanipulated images.
 
 ---
 
-## 📊 Benchmark Summary
+## 🚀 Getting Started & Google Colab H100 Execution
 
-DF-CMNet v2 sets state-of-the-art localization performance across standard benchmarks and generative inpainting suites:
+### Option A: One-Click Execution on Google Colab (H100 / A100 / T4)
+Open `Implementation/Colab_H100_Runner.ipynb` in Google Colab to run the entire pipeline with GPU acceleration:
+1. Automated dataset acquisition (`CASIA v2.0`, `Columbia`, `COVERAGE`, `CocoGlide`).
+2. Dual-stream architecture verification.
+3. 60-epoch mixed-precision training (`--amp`).
+4. Full benchmark evaluation across datasets and post-processing stress conditions.
+5. Export of checkpoints, JSON logs, and qualitative overlay figures.
 
-| Benchmark Dataset | Manipulation Type | Images Tested | $F_1$ Score (%) | AUC (%) |
-| :--- | :--- | :---: | :---: | :---: |
-| **CASIA v2.0** | Splicing & Copy-Move | 1,261 | **85.1** | **93.4** |
-| **Columbia** | Uncompressed Splicing | 180 | **92.4** | **96.8** |
-| **NIST'16** | Complex Blended Forgeries | 564 | **79.6** | **89.5** |
-| **COVERAGE** | Copy-Move Cloning | 100 | **78.2** | **87.9** |
-| **CASIA v1.0** | Splicing & Copy-Move | 921 | **83.7** | **91.8** |
-| **IMD2020** | Real-World Web Manipulations | 2,010 | **76.5** | **86.7** |
-| **CocoGlide** | Latent Diffusion Inpainting | 512 | **81.4** | **90.2** |
-| **AutoSplice** | Generative Text-to-Image / Inpaint | 1,288 | **80.8** | **89.6** |
-| **DEFACTO-LaMa** | Fast Fourier Inpainting Removal | 990 | **82.3** | **91.1** |
-
-*Efficiency:* Runs at **68.5 FPS** on an NVIDIA RTX 4090 GPU ($512 \times 512$) with only **5.24M parameters** and **19.28 GFLOPs**.
-
----
-
-## 🚀 Getting Started
-
-To explore the code, train models, or run inference, navigate to the `Implementation/` directory:
+### Option B: Local Environment
+To explore the code, train models, or run inference locally:
 
 ```bash
 cd Implementation

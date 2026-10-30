@@ -31,35 +31,33 @@ DF-CMNet resolves structural bottlenecks in passive image forensics (such as sem
 ```
 ├── models/                      # Deep learning architecture
 │   ├── __init__.py
-│   ├── bayar_conv.py            # Bayar constrained convolution (noise residual extraction)
+│   ├── bayar_conv.py            # Bayar constrained convolution (prediction-error residual extraction)
 │   ├── wavelet_dwt.py           # 2D Haar Discrete Wavelet Transform (sub-band decomposition)
-│   ├── cdbm.py                  # Cross-Domain Bidirectional Modulation (reciprocal attention)
-│   ├── bargm.py                 # Boundary-Aware Residual Guidance Module (ASPP edge head)
-│   └── df_cmnet.py              # Full DF-CMNet pipeline & progressive multi-scale decoder
+│   ├── cdbm.py / dacm.py        # Dual-Attention Cross-Domain Modulation (reciprocal spatial & channel attention)
+│   ├── bargm.py                 # Boundary-Aware Residual Guidance Module (ASPP edge head & seam gating)
+│   └── df_cmnet.py              # Full DF-CMNet pipeline & progressive multi-scale decoder (V1..V8 ablation ready)
 │
 ├── losses/                      # Loss formulations
 │   ├── __init__.py
-│   └── compound_loss.py         # Multi-task loss: Focal Loss + Dice Loss + Morphological Boundary BCE
+│   └── compound_loss.py         # Multi-task loss: Focal Loss + Regime-Decoupled Soft-IoU + ASP + Boundary BCE
 │
 ├── dataset/                     # Data loading & augmentation
 │   ├── __init__.py
-│   ├── forgery_dataset.py       # Benchmark loader (CASIA, Columbia, NIST'16, COVERAGE)
-│   └── synthetic_tamper.py      # On-the-fly synthetic tamper generator for out-of-the-box training
+│   ├── forgery_dataset.py       # Real benchmark loader (auto-discovers CASIA, Columbia, COVERAGE, IMD2020)
+│   └── synthetic_tamper.py      # On-the-fly synthetic tamper generator for local CPU smoke testing
 │
 ├── experiments/                 # Comprehensive evaluation & visualization suite
-│   ├── benchmark_suite.py       # Multi-benchmark stress testing & ablation suite
-│   ├── generate_qualitative_suite.py # Qualitative comparative visual generator
-│   └── generate_robustness_visuals.py # Robustness analysis under noise, blur, & compression
+│   ├── benchmark_suite.py       # Real multi-benchmark evaluation suite (Hausdorff 95, GFLOPs, robustness)
+│   └── generate_qualitative_suite.py # Zero-leakage qualitative & robustness visual generator
 │
-├── checkpoints/                 # Pretrained weights
-│   ├── best_model.pth           # Trained model weights (F1: 0.851, AUC: 0.934)
-│   └── best_model_60epochs.pth  # 60-epoch convergence checkpoint
-│
+├── checkpoints/                 # Model checkpoints directory
 ├── demo/                        # Sample test imagery & ground-truth masks
-├── results/                     # Benchmark artifacts, metric logs, & forensic heatmaps
+├── results/                     # Evaluation metrics, JSON logs, & qualitative heatmaps
+├── Colab_H100_Runner.ipynb      # One-click Master Google Colab H100 / A100 execution notebook
+├── download_datasets.py         # Automated Kagglehub & mirror benchmark dataset downloader
 ├── verify_model.py              # Unit tests, gradient flow checks, and throughput benchmarking
-├── train.py                     # Standard training & evaluation pipeline (F1, AUC, IoU)
-├── train_60_epochs.py           # Extended training pipeline with fast metric evaluations
+├── train.py                     # Mixed-precision training pipeline with ablation switches (V1..V8)
+├── train_60_epochs.py           # 60-epoch full training entry point
 ├── infer.py                     # Inference script producing heatmaps, masks, and boundary overlays
 ├── requirements.txt             # Environment dependencies
 ├── LICENSE                      # MIT License
@@ -86,7 +84,16 @@ pip install -r requirements.txt
 
 ## 🚀 Quick Start Guide
 
-### 1. Verify Architecture & Gradient Flow
+### 1. One-Click Google Colab Execution (H100 / A100 / T4)
+For fast GPU training and evaluation without manual setup, open `Colab_H100_Runner.ipynb` directly in Google Colab:
+1. Upload the `Implementation/` folder (or clone from GitHub) to your Google Drive / Colab environment.
+2. Open `Colab_H100_Runner.ipynb` in Colab.
+3. Select an H100, A100, or T4 GPU runtime.
+4. Run all cells sequentially.
+
+---
+
+### 2. Verify Architecture & Gradient Flow
 Run the automated verification suite to test forward pass, backward pass, gradient propagation across both spatial and frequency streams, parameter count, and inference throughput:
 
 ```bash

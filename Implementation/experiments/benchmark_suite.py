@@ -1,218 +1,449 @@
+"""
+Genuine Experimental Evaluation & Benchmarking Engine for DF-CMNet v2.
+
+Every metric in this suite is computed from actual PyTorch forward passes of DF_CMNet
+on dataset images, real post-processing distortions (JPEG, Gaussian blur, AWGN, geometric
+transforms, social media re-encoding), real distance-transform Hausdorff boundary evaluation,
+and real forward-hook MAC/FLOP & CUDA-event throughput profiling.
+
+No hardcoded benchmark numbers exist in this file.
+
+Usage on Google Colab H100:
+    python experiments/benchmark_suite.py --data_root ./data --checkpoint checkpoints/best_model.pth --img_size 256
+"""
+
 import os
 import sys
 import json
 import time
+import argparse
 import numpy as np
+from scipy.ndimage import distance_transform_edt
+from scipy.stats import wilcoxon
+from sklearn.metrics import roc_auc_score
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
 from models import DF_CMNet
+from losses.compound_loss import compute_morphological_boundary
+from dataset import PassiveForgeryDataset, SyntheticForgeryDataset, discover_forensic_samples
+
+
+def compute_boundary_and_hausdorff(pred_bin_2d, gt_bin_2d, band_kernel=5):
+    """
+    Computes Boundary F1, Boundary IoU (within a morphological band of width band_kernel),
+    and 95th-percentile Hausdorff Distance (d_H95 in pixels) using Euclidean Distance Transform.
+    """
+    p_t = torch.from_numpy(pred_bin_2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+    g_t = torch.from_numpy(gt_bin_2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+
+    b_pred = compute_morphological_boundary(p_t, kernel_size=band_kernel).squeeze().numpy() > 0.5
+    b_gt = compute_morphological_boundary(g_t, kernel_size=band_kernel).squeeze().numpy() > 0.5
+
+    if not np.any(b_gt):
+        return None
+
+    tp = float(np.sum(b_pred & b_gt))
+    fp = float(np.sum(b_pred & (~b_gt)))
+    fn = float(np.sum((~b_pred) & b_gt))
+
+    b_f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-7)
+    b_iou = tp / (tp + fp + fn + 1e-7)
+
+    # 95th-percentile Hausdorff distance via Euclidean Distance Transform
+    if not np.any(b_pred):
+        h, w = gt_bin_2d.shape
+        hd95 = float(np.hypot(h, w))
+    else:
+        dt_gt = distance_transform_edt(~b_gt)
+        dt_pred = distance_transform_edt(~b_pred)
+        d_pred_to_gt = dt_gt[b_pred]
+        d_gt_to_pred = dt_pred[b_gt]
+        all_dists = np.concatenate([d_pred_to_gt, d_gt_to_pred])
+        hd95 = float(np.percentile(all_dists, 95))
+
+    return b_f1, b_iou, hd95
 
 
 class ForensicBenchmarkSuite:
     """
-    Comprehensive 14-Dimensional Experimental Evaluation Suite for DF-CMNet v2.
-    Reconciles all dataset splits, modern baselines (2018-2024), diffusion inpainting
-    benchmarks, multi-seed variance, ablation studies, and complexity profiles.
+    Real End-to-End Evaluation Suite for DF-CMNet v2.
     """
+    def __init__(
+        self,
+        model=None,
+        checkpoint_path="checkpoints/best_model.pth",
+        data_root="./data",
+        img_size=256,
+        batch_size=16,
+        device=None,
+        save_dir="results"
+    ):
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
 
-    def __init__(self, model=None, device="cpu", save_dir="results"):
-        self.device = torch.device(device)
+        self.data_root = data_root
+        self.img_size = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
+        self.batch_size = batch_size
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
-        if model is None:
-            self.model = DF_CMNet().to(self.device)
-        else:
+
+        if model is not None:
             self.model = model.to(self.device)
+        else:
+            self.model = DF_CMNet(variant="V8").to(self.device)
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+                state = ckpt.get("model_state_dict", ckpt)
+                self.model.load_state_dict(state, strict=False)
+                print(f"[+] Loaded model checkpoint from {checkpoint_path}")
+            else:
+                print(f"[!] Checkpoint '{checkpoint_path}' not found; evaluating current model weights.")
+
         self.model.eval()
+
+    def _get_dataset(self, ds_dir, split="test", eval_distortion=None, fallback_synthetic=False):
+        if ds_dir and os.path.exists(ds_dir):
+            ds = PassiveForgeryDataset(
+                root_dir=ds_dir,
+                img_size=self.img_size,
+                is_train=False,
+                split=split,
+                crop_mode="native",
+                simulate_jpeg=False,
+                eval_distortion=eval_distortion
+            )
+            if len(ds) > 0:
+                return ds
+        if fallback_synthetic:
+            print(f"[!] Dataset directory '{ds_dir}' not found; using SyntheticForgeryDataset for smoke testing.")
+            return SyntheticForgeryDataset(num_samples=40, img_size=self.img_size, is_train=False)
+        return None
+
+    @torch.no_grad()
+    def evaluate_loader(self, loader, compute_boundary=True, compute_scale_bins=False):
+        self.model.eval()
+        f1_list, prec_list, rec_list, iou_list = [], [], [], []
+        auth_fpr_list = []
+        bf1_list, biou_list, hd95_list = [], [], []
+        scale_bins = {
+            "Tiny (<2%)": [],
+            "Small (2%-10%)": [],
+            "Medium (10%-30%)": [],
+            "Large (>30%)": []
+        }
+
+        all_flat_preds = []
+        all_flat_targets = []
+
+        for images, masks, _ in loader:
+            images = images.to(self.device, non_blocking=True)
+            outputs = self.model(images)
+
+            preds_np = outputs["mask_pred"].squeeze(1).float().cpu().numpy()
+            masks_np = masks.squeeze(1).float().cpu().numpy()
+
+            for i in range(len(masks_np)):
+                p_prob = preds_np[i]
+                t_bin = (masks_np[i] > 0.5).astype(np.uint8)
+                p_bin = (p_prob >= 0.5).astype(np.uint8)
+
+                all_flat_preds.append(p_prob.reshape(-1)[::4])  # Strided subsample for fast exact ROC-AUC
+                all_flat_targets.append(t_bin.reshape(-1)[::4])
+
+                fg_pixels = int(np.sum(t_bin))
+                total_pixels = int(t_bin.size)
+
+                if fg_pixels == 0:
+                    auth_fpr_list.append(float(np.mean(p_bin)))
+                else:
+                    tp = float(np.sum((p_bin == 1) & (t_bin == 1)))
+                    fp = float(np.sum((p_bin == 1) & (t_bin == 0)))
+                    fn = float(np.sum((p_bin == 0) & (t_bin == 1)))
+                    prec = tp / (tp + fp + 1e-7)
+                    rec = tp / (tp + fn + 1e-7)
+                    f1 = (2.0 * prec * rec) / (prec + rec + 1e-7)
+                    iou = tp / (tp + fp + fn + 1e-7)
+
+                    f1_list.append(f1)
+                    prec_list.append(prec)
+                    rec_list.append(rec)
+                    iou_list.append(iou)
+
+                    if compute_scale_bins:
+                        ratio = (fg_pixels / float(total_pixels)) * 100.0
+                        if ratio < 2.0:
+                            scale_bins["Tiny (<2%)"].append(f1 * 100.0)
+                        elif ratio < 10.0:
+                            scale_bins["Small (2%-10%)"].append(f1 * 100.0)
+                        elif ratio < 30.0:
+                            scale_bins["Medium (10%-30%)"].append(f1 * 100.0)
+                        else:
+                            scale_bins["Large (>30%)"].append(f1 * 100.0)
+
+                    if compute_boundary:
+                        b_res = compute_boundary_and_hausdorff(p_bin, t_bin, band_kernel=5)
+                        if b_res is not None:
+                            bf1_list.append(b_res[0])
+                            biou_list.append(b_res[1])
+                            hd95_list.append(b_res[2])
+
+        flat_p = np.concatenate(all_flat_preds) if all_flat_preds else np.array([0.0])
+        flat_t = np.concatenate(all_flat_targets) if all_flat_targets else np.array([0])
+        try:
+            auc = float(roc_auc_score(flat_t, flat_p)) * 100.0
+        except Exception:
+            auc = 50.0
+
+        metrics = {
+            "num_samples": len(loader.dataset),
+            "num_tampered": len(f1_list),
+            "num_authentic": len(auth_fpr_list),
+            "F1": round(float(np.mean(f1_list) * 100.0), 2) if f1_list else 0.0,
+            "F1_std": round(float(np.std(f1_list) * 100.0), 2) if f1_list else 0.0,
+            "Precision": round(float(np.mean(prec_list) * 100.0), 2) if prec_list else 0.0,
+            "Recall": round(float(np.mean(rec_list) * 100.0), 2) if rec_list else 0.0,
+            "IoU": round(float(np.mean(iou_list) * 100.0), 2) if iou_list else 0.0,
+            "AUC": round(auc, 2),
+            "Auth_FPR": round(float(np.mean(auth_fpr_list) * 100.0), 2) if auth_fpr_list else 0.0,
+        }
+
+        if compute_boundary and bf1_list:
+            metrics["Boundary_F1"] = round(float(np.mean(bf1_list) * 100.0), 2)
+            metrics["Boundary_IoU"] = round(float(np.mean(biou_list) * 100.0), 2)
+            metrics["Hausdorff_95_px"] = round(float(np.mean(hd95_list)), 2)
+
+        if compute_scale_bins:
+            metrics["Scale_Stratified_F1"] = {
+                k: (round(float(np.mean(v)), 2) if len(v) > 0 else None)
+                for k, v in scale_bins.items()
+            }
+
+        return metrics, f1_list
+
+    def eval_datasets(self):
+        """
+        Evaluates all discovered datasets under `self.data_root`.
+        """
+        dataset_specs = [
+            ("CASIA_v2", "test"),
+            ("CASIA_v1", "all"),
+            ("Columbia", "all"),
+            ("NIST16", "test"),
+            ("COVERAGE", "all"),
+            ("IMD2020", "test"),
+            ("CocoGlide", "all"),
+            ("AutoSplice", "all"),
+            ("LaMa", "all"),
+        ]
+        results = {}
+        nw = 2 if self.device.type == "cuda" else 0
+
+        for name, split in dataset_specs:
+            ds_path = os.path.join(self.data_root, name)
+            ds = self._get_dataset(ds_path, split=split, fallback_synthetic=False)
+            if ds is None or len(ds) == 0:
+                continue
+            print(f"[*] Evaluating {name} ({split} split, {len(ds)} images)...")
+            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=nw)
+            metrics, _ = self.evaluate_loader(loader, compute_boundary=True, compute_scale_bins=True)
+            results[name] = metrics
+            print(f"    -> {name}: F1={metrics['F1']}% | IoU={metrics['IoU']}% | AUC={metrics['AUC']}% | Auth_FPR={metrics['Auth_FPR']}%")
+
+        # Fallback if no real dataset is present on local PC yet
+        if not results:
+            primary_dir = os.path.join(self.data_root, "CASIA_v2")
+            ds = self._get_dataset(primary_dir, split="test", fallback_synthetic=True)
+            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=0)
+            metrics, _ = self.evaluate_loader(loader, compute_boundary=True, compute_scale_bins=True)
+            results["Synthetic_Smoke_Test"] = metrics
+
+        return results
+
+    def eval_robustness_suite(self, dataset_name="CASIA_v2", split="test"):
+        """
+        Runs genuine post-processing robustness evaluations across JPEG, Gaussian Blur,
+        AWGN, Geometric Scaling/Rotation, and Social Media re-encoding pipelines.
+        """
+        ds_path = os.path.join(self.data_root, dataset_name)
+        use_synth = not (os.path.exists(ds_path) and len(discover_forensic_samples(ds_path)) > 0)
+        nw = 2 if (self.device.type == "cuda" and not use_synth) else 0
+
+        def _run_condition(distortion):
+            if use_synth:
+                ds = SyntheticForgeryDataset(num_samples=32, img_size=self.img_size, is_train=False)
+            else:
+                ds = PassiveForgeryDataset(
+                    root_dir=ds_path,
+                    img_size=self.img_size,
+                    is_train=False,
+                    split=split,
+                    crop_mode="native",
+                    simulate_jpeg=False,
+                    eval_distortion=distortion
+                )
+            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=nw)
+            m, _ = self.evaluate_loader(loader, compute_boundary=False, compute_scale_bins=False)
+            return {"F1": m["F1"], "IoU": m["IoU"], "AUC": m["AUC"], "Auth_FPR": m["Auth_FPR"]}
+
+        print(f"[*] Running Real Post-Processing Robustness Suite on {dataset_name if not use_synth else 'Synthetic_Test'}...")
+
+        jpeg_res = {}
+        for qf in [100, 90, 80, 70, 60, 50, 40]:
+            jpeg_res[f"QF_{qf}"] = _run_condition(("jpeg", qf))
+
+        blur_res = {}
+        for sigma in [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]:
+            blur_res[f"sigma_{sigma}"] = _run_condition(("blur", sigma))
+
+        noise_res = {}
+        for s255 in [0, 5, 10, 15, 25]:
+            norm_var = round((s255 / 255.0) ** 2, 4)
+            r = _run_condition(("noise", s255))
+            r["sigma_255"] = s255
+            r["norm_variance"] = norm_var
+            noise_res[f"sigma255_{s255}"] = r
+
+        geom_res = {}
+        for scale in [0.5, 0.75, 1.25, 1.5]:
+            geom_res[f"Scale_{scale}x"] = _run_condition(("scale", scale))
+        for deg in [5, 15, 30]:
+            geom_res[f"Rotate_{deg}deg"] = _run_condition(("rotate", deg))
+
+        social_res = {}
+        for plat in ["telegram", "wechat", "facebook", "whatsapp"]:
+            social_res[plat] = _run_condition(("social", plat))
+
+        return {
+            "dataset_evaluated": dataset_name if not use_synth else "Synthetic_Smoke_Test",
+            "jpeg_robustness": jpeg_res,
+            "blur_robustness": blur_res,
+            "noise_robustness": noise_res,
+            "geometric_robustness": geom_res,
+            "social_media_robustness": social_res,
+        }
+
+    def eval_complexity_and_throughput(self):
+        """
+        Measures exact parameter counts per module, exact MACs/GFLOPs via forward hooks
+        at 256^2, 512^2, and 1024^2, and real FPS throughput on the active device.
+        """
+        m = DF_CMNet(variant="V8").to(self.device).eval()
+
+        def _count_m(mod):
+            return round(sum(p.numel() for p in mod.parameters()) / 1e6, 3)
+
+        param_breakdown = {
+            "Spatial_Encoder_M": _count_m(m.spatial_encoder),
+            "LHFRE_and_Spectral_Encoder_M": round(
+                _count_m(m.bayar) + _count_m(m.res_norm) + _count_m(m.dwt_norm) + _count_m(m.freq_encoder), 3
+            ),
+            "Four_DACM_Blocks_M": round(sum(_count_m(getattr(m, f"cdbm{i}")) for i in range(1, 5)), 3),
+            "BARGM_Module_M": _count_m(m.bargm),
+            "Multi_Scale_Decoder_M": round(
+                sum(_count_m(x) for x in [m.dec_bridge, m.dec_fuse3, m.dec_fuse2, m.dec_fuse1,
+                                          m.aux_head3, m.aux_head2, m.final_mask_head]), 3
+            ),
+            "Total_Params_M": _count_m(m),
+        }
+
+        macs_counter = {"n": 0}
+
+        def _conv_hook(mod, inp, out):
+            k = mod.kernel_size[0] * mod.kernel_size[1] * (mod.in_channels // mod.groups)
+            macs_counter["n"] += out.numel() * k
+
+        def _lin_hook(mod, inp, out):
+            macs_counter["n"] += out.numel() * mod.in_features
+
+        hooks = []
+        for sub in m.modules():
+            if isinstance(sub, nn.Conv2d):
+                hooks.append(sub.register_forward_hook(_conv_hook))
+            elif isinstance(sub, nn.Linear):
+                hooks.append(sub.register_forward_hook(_lin_hook))
+
+        scaling_profile = {}
+        for res in [256, 512, 1024]:
+            macs_counter["n"] = 0
+            dummy = torch.randn(1, 3, res, res, device=self.device)
+            with torch.no_grad():
+                m(dummy)
+            # Include Bayar 5x5 F.conv2d + 2D Haar DWT 2x2 depthwise stride-2 F.conv2d
+            bayar_macs = res * res * 3 * 3 * 25
+            dwt_macs = (res // 2) * (res // 2) * 12 * 4
+            total_gmacs = (macs_counter["n"] + bayar_macs + dwt_macs) / 1e9
+            total_gflops = 2.0 * total_gmacs
+
+            # Measure real throughput (FPS)
+            with torch.no_grad():
+                for _ in range(5):
+                    m(dummy)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    n_iters = 30
+                    for _ in range(n_iters):
+                        m(dummy)
+                    torch.cuda.synchronize()
+                    elapsed = time.perf_counter() - t0
+                else:
+                    t0 = time.perf_counter()
+                    n_iters = 5
+                    for _ in range(n_iters):
+                        m(dummy)
+                    elapsed = time.perf_counter() - t0
+
+            fps = round(n_iters / max(elapsed, 1e-6), 2)
+            scaling_profile[f"Resolution_{res}x{res}"] = {
+                "GMACs": round(total_gmacs, 2),
+                "GFLOPs": round(total_gflops, 2),
+                "Measured_FPS": fps,
+                "Device": str(self.device)
+                     + (f" ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else " (CPU)")
+            }
+
+        for h in hooks:
+            h.remove()
+
+        return {
+            "parameter_breakdown_M": param_breakdown,
+            "resolution_scaling": scaling_profile
+        }
 
     def run_all_benchmarks(self):
         all_results = {
-            "r0_dataset_splits": self.eval_r0_dataset_splits(),
-            "r1_intra_dataset": self.eval_r1_intra_dataset(),
-            "r2_cross_dataset": self.eval_r2_cross_dataset(),
-            "r3_forgery_types": self.eval_r3_forgery_types(),
-            "r4_scale_sensitivity": self.eval_r4_scale_sensitivity(),
-            "r5_jpeg_robustness": self.eval_r5_jpeg_robustness(),
-            "r6_blur_robustness": self.eval_r6_blur_robustness(),
-            "r7_noise_robustness": self.eval_r7_noise_robustness(),
-            "r8_geometric_robustness": self.eval_r8_geometric_robustness(),
-            "r9_social_media": self.eval_r9_social_media(),
-            "r10_boundary_metrics": self.eval_r10_boundary_metrics(),
-            "r11_ablation_study": self.eval_r11_ablation_study(),
-            "r12_complexity_throughput": self.eval_r12_complexity_throughput(),
-            "r13_diffusion_benchmarks": self.eval_r13_diffusion_benchmarks(),
+            "complexity_and_throughput": self.eval_complexity_and_throughput(),
+            "dataset_evaluations": self.eval_datasets(),
+            "robustness_evaluations": self.eval_robustness_suite(),
         }
         out_json = os.path.join(self.save_dir, "benchmark_12_results.json")
         with open(out_json, "w") as f:
             json.dump(all_results, f, indent=4)
-        print(f"[+] Saved reconciled benchmark suite to {out_json}")
+        print(f"[+] Saved genuine measured benchmark results to {out_json}")
         return all_results
-
-    def eval_r0_dataset_splits(self):
-        return {
-            "CASIA_v2": {"Authentic": 7491, "Tampered": 5123, "Train": 10091, "Val": 1261, "Test": 1262},
-            "CASIA_v1": {"Authentic": 800, "Tampered": 921, "Train": 1377, "Val": 172, "Test": 172},
-            "Columbia": {"Authentic": 183, "Tampered": 180, "Train": 290, "Val": 36, "Test": 37},
-            "NIST16": {"Authentic": 0, "Tampered": 564, "Train": 404, "Val": 50, "Test": 110},
-            "COVERAGE": {"Authentic": 100, "Tampered": 100, "Train": 140, "Val": 20, "Test": 40},
-            "IMD2020": {"Authentic": 414, "Tampered": 2010, "Train": 1939, "Val": 242, "Test": 243},
-            "CocoGlide": {"Authentic": 0, "Tampered": 512, "Train": 0, "Val": 0, "Test": 512},
-            "AutoSplice": {"Authentic": 2273, "Tampered": 3621, "Train": 0, "Val": 0, "Test": 1288},
-        }
-
-    def eval_r1_intra_dataset(self):
-        return {
-            "CASIA_v1": {
-                "RGB_N": [55.4, 79.5], "ManTra": [61.7, 81.9], "SPAN": [68.2, 84.6],
-                "MVSS_Net": [74.8, 88.3], "PSCC_Net": [76.5, 89.7], "CAT_Net_v2": [78.9, 91.2],
-                "ObjectFormer": [80.2, 92.1], "HiFi_Net": [79.1, 91.5], "TruFor": [79.6, 91.8],
-                "IML_ViT": [81.4, 92.9], "DF_CMNet_v2": [84.6, 94.8]
-            },
-            "CASIA_v2": {
-                "RGB_N": [48.9, 78.8], "ManTra": [55.4, 82.1], "SPAN": [62.5, 85.4],
-                "MVSS_Net": [71.4, 88.9], "PSCC_Net": [74.2, 89.5], "CAT_Net_v2": [77.6, 90.4],
-                "ObjectFormer": [78.3, 90.6], "HiFi_Net": [78.8, 90.9], "TruFor": [80.7, 91.5],
-                "IML_ViT": [81.9, 92.1], "DF_CMNet_v2": [85.1, 93.4]
-            },
-            "Columbia": {
-                "RGB_N": [67.2, 85.8], "ManTra": [74.3, 88.5], "SPAN": [81.4, 91.2],
-                "MVSS_Net": [86.9, 94.7], "PSCC_Net": [88.3, 95.1], "CAT_Net_v2": [90.1, 96.0],
-                "ObjectFormer": [90.5, 96.2], "HiFi_Net": [89.7, 95.8], "TruFor": [91.8, 96.8],
-                "IML_ViT": [92.4, 97.2], "DF_CMNet_v2": [94.8, 98.4]
-            },
-            "NIST16": {
-                "RGB_N": [42.1, 75.3], "ManTra": [50.2, 79.6], "SPAN": [58.7, 83.8],
-                "MVSS_Net": [69.4, 88.2], "PSCC_Net": [72.8, 89.6], "CAT_Net_v2": [75.1, 90.8],
-                "ObjectFormer": [76.8, 91.4], "HiFi_Net": [77.4, 91.9], "TruFor": [78.2, 92.6],
-                "IML_ViT": [79.5, 93.3], "DF_CMNet_v2": [82.7, 95.1]
-            },
-            "COVERAGE": {
-                "RGB_N": [43.7, 81.2], "ManTra": [48.9, 83.1], "SPAN": [55.8, 86.4],
-                "MVSS_Net": [64.2, 90.1], "PSCC_Net": [67.9, 91.4], "CAT_Net_v2": [69.5, 92.0],
-                "ObjectFormer": [72.5, 93.2], "HiFi_Net": [71.2, 92.5], "TruFor": [71.9, 93.0],
-                "IML_ViT": [73.8, 93.9], "DF_CMNet_v2": [77.8, 95.8]
-            },
-            "IMD2020": {
-                "RGB_N": [46.3, 76.5], "ManTra": [53.1, 80.4], "SPAN": [60.1, 83.9],
-                "MVSS_Net": [68.5, 87.6], "PSCC_Net": [70.8, 88.4], "CAT_Net_v2": [73.6, 89.5],
-                "ObjectFormer": [75.4, 90.2], "HiFi_Net": [74.9, 90.0], "TruFor": [77.1, 91.4],
-                "IML_ViT": [78.2, 91.9], "DF_CMNet_v2": [81.5, 93.7]
-            },
-        }
-
-    def eval_r2_cross_dataset(self):
-        return {
-            "Train_Dataset": "CASIA_v2",
-            "Evaluations": {
-                "Columbia": {"Baseline_Avg_F1": 76.4, "MVSS_Net_F1": 78.5, "CAT_Net_v2_F1": 81.6, "IML_ViT_F1": 83.4, "TruFor_F1": 84.2, "DF_CMNet_v2_F1": 89.6, "DF_CMNet_v2_AUC": 96.2},
-                "NIST16":   {"Baseline_Avg_F1": 58.1, "MVSS_Net_F1": 61.8, "CAT_Net_v2_F1": 66.4, "IML_ViT_F1": 69.8, "TruFor_F1": 71.5, "DF_CMNet_v2_F1": 76.8, "DF_CMNet_v2_AUC": 91.4},
-                "COVERAGE": {"Baseline_Avg_F1": 52.4, "MVSS_Net_F1": 56.2, "CAT_Net_v2_F1": 61.0, "IML_ViT_F1": 65.1, "TruFor_F1": 66.8, "DF_CMNet_v2_F1": 72.3, "DF_CMNet_v2_AUC": 92.0},
-                "IMD2020":  {"Baseline_Avg_F1": 56.7, "MVSS_Net_F1": 60.4, "CAT_Net_v2_F1": 66.9, "IML_ViT_F1": 70.3, "TruFor_F1": 72.0, "DF_CMNet_v2_F1": 77.4, "DF_CMNet_v2_AUC": 91.8},
-            },
-        }
-
-    def eval_r3_forgery_types(self):
-        return {
-            "Splicing":        {"F1": 86.4, "AUC": 95.2, "IoU": 76.8, "Samples": 2500},
-            "Copy_Move":       {"F1": 82.9, "AUC": 93.7, "IoU": 71.5, "Samples": 2200},
-            "Deep_Inpainting": {"F1": 84.1, "AUC": 94.6, "IoU": 73.2, "Samples": 1800},
-            "Content_Removal": {"F1": 81.6, "AUC": 92.8, "IoU": 69.4, "Samples": 1200},
-        }
-
-    def eval_r4_scale_sensitivity(self):
-        return {
-            "Small_under_5pct":  {"F1": 74.2, "AUC": 89.6, "IoU": 59.8, "Avg_Area_Pct": 2.8},
-            "Medium_5_to_15pct": {"F1": 85.8, "AUC": 94.7, "IoU": 75.6, "Avg_Area_Pct": 9.4},
-            "Large_over_15pct":  {"F1": 88.4, "AUC": 96.8, "IoU": 79.5, "Avg_Area_Pct": 24.1},
-        }
-
-    def eval_r5_jpeg_robustness(self):
-        return {
-            "QF_90": {"DF_CMNet_v2": 85.1, "TruFor": 80.7, "MVSS_Net": 71.4, "SPAN": 62.5},
-            "QF_80": {"DF_CMNet_v2": 83.8, "TruFor": 78.1, "MVSS_Net": 68.9, "SPAN": 59.1},
-            "QF_70": {"DF_CMNet_v2": 81.2, "TruFor": 74.2, "MVSS_Net": 64.1, "SPAN": 54.3},
-            "QF_60": {"DF_CMNet_v2": 78.4, "TruFor": 69.5, "MVSS_Net": 58.7, "SPAN": 48.6},
-            "QF_50": {"DF_CMNet_v2": 74.6, "TruFor": 64.1, "MVSS_Net": 52.3, "SPAN": 41.2},
-            "QF_40": {"DF_CMNet_v2": 68.9, "TruFor": 57.8, "MVSS_Net": 44.5, "SPAN": 33.8},
-        }
-
-    def eval_r6_blur_robustness(self):
-        return {
-            "sigma_0.5": {"DF_CMNet_v2": 84.5, "TruFor": 79.2, "MVSS_Net": 69.8, "SPAN": 60.4},
-            "sigma_1.0": {"DF_CMNet_v2": 82.4, "TruFor": 75.1, "MVSS_Net": 64.2, "SPAN": 54.8},
-            "sigma_1.5": {"DF_CMNet_v2": 79.1, "TruFor": 70.3, "MVSS_Net": 59.1, "SPAN": 48.7},
-            "sigma_2.0": {"DF_CMNet_v2": 75.8, "TruFor": 64.8, "MVSS_Net": 53.6, "SPAN": 42.1},
-            "sigma_2.5": {"DF_CMNet_v2": 71.2, "TruFor": 58.4, "MVSS_Net": 47.2, "SPAN": 35.9},
-        }
-
-    def eval_r7_noise_robustness(self):
-        return {
-            "variance_0.01": {"sigma_255": 5.0, "DF_CMNet_v2": 83.9, "TruFor": 78.4, "MVSS_Net": 68.2},
-            "variance_0.02": {"sigma_255": 10.0, "DF_CMNet_v2": 81.5, "TruFor": 74.8, "MVSS_Net": 63.5},
-            "variance_0.05": {"sigma_255": 15.0, "DF_CMNet_v2": 76.2, "TruFor": 67.3, "MVSS_Net": 54.9},
-            "variance_0.10": {"sigma_255": 25.0, "DF_CMNet_v2": 69.4, "TruFor": 59.1, "MVSS_Net": 45.8},
-        }
-
-    def eval_r8_geometric_robustness(self):
-        return {
-            "Scale_0.5x":   {"F1": 78.2, "AUC": 90.8},
-            "Scale_0.75x":  {"F1": 82.5, "AUC": 92.4},
-            "Scale_1.25x":  {"F1": 84.6, "AUC": 93.8},
-            "Scale_1.50x":  {"F1": 83.1, "AUC": 93.1},
-            "Rot_pm_5deg":  {"F1": 84.4, "AUC": 93.6},
-            "Rot_pm_15deg": {"F1": 82.1, "AUC": 92.2},
-            "Rot_pm_30deg": {"F1": 79.5, "AUC": 90.5},
-        }
-
-    def eval_r9_social_media(self):
-        return {
-            "Uncompressed_PNG":  {"DF_CMNet_v2": 85.1, "TruFor": 80.7, "MVSS_Net": 71.4},
-            "WhatsApp_Pipeline": {"DF_CMNet_v2": 78.6, "TruFor": 71.2, "MVSS_Net": 59.4},
-            "WeChat_Pipeline":   {"DF_CMNet_v2": 77.2, "TruFor": 69.8, "MVSS_Net": 57.8},
-            "Twitter_Pipeline":  {"DF_CMNet_v2": 79.4, "TruFor": 72.8, "MVSS_Net": 61.2},
-            "Telegram_Pipeline": {"DF_CMNet_v2": 81.0, "TruFor": 75.4, "MVSS_Net": 64.6},
-        }
-
-    def eval_r10_boundary_metrics(self):
-        return {
-            "DF_CMNet_v2": {"Boundary_F1": 74.8, "Boundary_IoU": 61.2, "Mean_Hausdorff_Distance_px": 2.14},
-            "IML_ViT":     {"Boundary_F1": 70.1, "Boundary_IoU": 55.4, "Mean_Hausdorff_Distance_px": 3.45},
-            "TruFor":      {"Boundary_F1": 68.5, "Boundary_IoU": 53.6, "Mean_Hausdorff_Distance_px": 3.82},
-            "CAT_Net_v2":  {"Boundary_F1": 65.2, "Boundary_IoU": 49.8, "Mean_Hausdorff_Distance_px": 4.41},
-            "MVSS_Net":    {"Boundary_F1": 62.4, "Boundary_IoU": 46.8, "Mean_Hausdorff_Distance_px": 4.95},
-            "SPAN":        {"Boundary_F1": 53.1, "Boundary_IoU": 38.4, "Mean_Hausdorff_Distance_px": 6.78},
-            "RGB_N":       {"Boundary_F1": 42.6, "Boundary_IoU": 29.5, "Mean_Hausdorff_Distance_px": 8.91},
-        }
-
-    def eval_r11_ablation_study(self):
-        return [
-            {"Variant": "V1: Spatial Stream Only",              "CASIA_v2_F1": 69.4, "CASIA_v2_AUC": 84.7, "NIST16_F1": 64.1},
-            {"Variant": "V2: Frequency Stream Only",            "CASIA_v2_F1": 63.8, "CASIA_v2_AUC": 80.5, "NIST16_F1": 58.6},
-            {"Variant": "V3: Dual Stream w/ Naive Concat",      "CASIA_v2_F1": 76.5, "CASIA_v2_AUC": 88.3, "NIST16_F1": 72.3},
-            {"Variant": "V4: Dual Stream w/ Spatial-Only DACM", "CASIA_v2_F1": 80.9, "CASIA_v2_AUC": 90.7, "NIST16_F1": 77.5},
-            {"Variant": "V5: DACM w/o Residual Standardization","CASIA_v2_F1": 81.8, "CASIA_v2_AUC": 91.2, "NIST16_F1": 78.4},
-            {"Variant": "V6: DACM w/o BARGM Boundary Guidance", "CASIA_v2_F1": 82.4, "CASIA_v2_AUC": 91.6, "NIST16_F1": 79.1},
-            {"Variant": "V7: DACM w/ Standard Dice Loss",       "CASIA_v2_F1": 81.6, "CASIA_v2_AUC": 91.1, "NIST16_F1": 78.3},
-            {"Variant": "V8: Full Proposed DF-CMNet v2",        "CASIA_v2_F1": 85.1, "CASIA_v2_AUC": 93.4, "NIST16_F1": 82.7},
-        ]
-
-    def eval_r12_complexity_throughput(self):
-        return {
-            "Resolution_256x256":   {"GFLOPs": 14.8,  "Params_M": 5.24, "FPS_CPU": 28.1, "FPS_GPU_RTX4090": 215.0},
-            "Resolution_512x512":   {"GFLOPs": 59.2,  "Params_M": 5.24, "FPS_CPU": 7.4,  "FPS_GPU_RTX4090": 68.5},
-            "Resolution_1024x1024": {"GFLOPs": 236.8, "Params_M": 5.24, "FPS_CPU": 1.8,  "FPS_GPU_RTX4090": 18.2},
-        }
-
-    def eval_r13_diffusion_benchmarks(self):
-        return {
-            "CocoGlide":  {"MVSS_Net": [54.2, 79.8], "CAT_Net_v2": [61.5, 84.1], "TruFor": [68.9, 88.4], "IML_ViT": [70.2, 89.1], "DF_CMNet_v2": [76.4, 93.2]},
-            "AutoSplice": {"MVSS_Net": [58.7, 81.6], "CAT_Net_v2": [64.8, 85.9], "TruFor": [72.4, 90.2], "IML_ViT": [74.1, 91.0], "DF_CMNet_v2": [79.8, 94.5]},
-            "LaMa_Clean": {"MVSS_Net": [56.1, 80.4], "CAT_Net_v2": [62.3, 84.7], "TruFor": [70.8, 89.5], "IML_ViT": [72.0, 90.3], "DF_CMNet_v2": [78.2, 93.8]},
-        }
 
 
 if __name__ == "__main__":
-    suite = ForensicBenchmarkSuite()
+    parser = argparse.ArgumentParser(description="Run Genuine DF-CMNet v2 Benchmark Suite")
+    parser.add_argument("--data_root", type=str, default="./data", help="Root directory containing datasets")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pth", help="Trained checkpoint path")
+    parser.add_argument("--img_size", type=int, default=256, help="Evaluation crop/patch resolution")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--save_dir", type=str, default="results", help="Output directory for JSON results")
+    args = parser.parse_args()
+
+    suite = ForensicBenchmarkSuite(
+        checkpoint_path=args.checkpoint,
+        data_root=args.data_root,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        save_dir=args.save_dir
+    )
     suite.run_all_benchmarks()
