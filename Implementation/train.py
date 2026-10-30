@@ -176,6 +176,8 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--results_dir", type=str, default="results", help="Directory to save JSON logs")
     parser.add_argument("--ckpt_name", type=str, default="best_model.pth", help="Output checkpoint filename")
+    parser.add_argument("--allow_synthetic", action="store_true", default=False,
+                        help="Explicitly permit SyntheticForgeryDataset for local dry-run unit tests ONLY. Defaults to False.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -187,9 +189,9 @@ def main():
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
-    print(f"[*] Training DF-CMNet v2 (Variant {args.variant}, Seed {args.seed}) on {device} (AMP={use_amp}, dtype={amp_dtype})")
-
     img_size = (args.img_size, args.img_size)
+    is_real = False
+
     if args.data_dir and os.path.exists(args.data_dir):
         train_dataset = PassiveForgeryDataset(
             args.data_dir, img_size=img_size, is_train=True, split='train',
@@ -199,11 +201,36 @@ def main():
             args.data_dir, img_size=img_size, is_train=False, split='val',
             split_seed=args.seed, crop_mode=args.crop_mode, simulate_jpeg=False
         )
-        print(f"[*] Loaded real dataset from {args.data_dir}: {len(train_dataset)} train | {len(val_dataset)} val")
-    else:
-        print("[!] WARNING: No --data_dir found. Falling back to SyntheticForgeryDataset for local smoke testing.")
+        if len(train_dataset) < 50:
+            raise RuntimeError(
+                f"[FATAL INTEGRITY ERROR] Only {len(train_dataset)} training samples found at '{args.data_dir}'! "
+                f"Real forensic datasets require hundreds/thousands of images. Execution aborted to prevent training on corrupt paths."
+            )
+        is_real = True
+        print("=" * 80)
+        print(f"[PROVENANCE: GENUINE REAL DATASET CONFIRMED]")
+        print(f"  Dataset Root   : {os.path.abspath(args.data_dir)}")
+        print(f"  Train Samples  : {len(train_dataset)} real images")
+        print(f"  Val Samples    : {len(val_dataset)} real images")
+        print(f"  Resolution/Crop: {args.crop_mode} ({args.img_size}x{args.img_size})")
+        print("=" * 80)
+    elif args.allow_synthetic:
+        print("!" * 80)
+        print("[!] CAUTION: --allow_synthetic explicitly passed. Using Synthetic dummy dataset for SMOKE TESTING ONLY.")
+        print("!" * 80)
         train_dataset = SyntheticForgeryDataset(num_samples=160, img_size=img_size, is_train=True)
         val_dataset = SyntheticForgeryDataset(num_samples=40, img_size=img_size, is_train=False)
+        is_real = False
+    else:
+        raise FileNotFoundError(
+            f"\n[FATAL ERROR] Dataset path '{args.data_dir}' does not exist or was not specified!\n"
+            f"Silent fallback to synthetic/dummy data has been completely DISABLED to guarantee zero experimental contamination.\n"
+            f"Actions to resolve:\n"
+            f"  1. On Google Colab / GPU: Run `python download_datasets.py --data_root ./data` first, then pass `--data_dir ./data/CASIA_v2`.\n"
+            f"  2. For dry-run code testing only: Explicitly pass `--allow_synthetic`.\n"
+        )
+
+    print(f"[*] Training DF-CMNet v2 (Variant {args.variant}, Seed {args.seed}) on {device} (AMP={use_amp}, dtype={amp_dtype})")
 
     nw = args.num_workers if device.type == "cuda" else 0
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -302,7 +329,14 @@ def main():
               f"AUC: {res['auc']*100:.2f}% | Auth FPR: {res['auth_fpr']*100:.2f}%")
 
         checkpoint = {
+            'model_name': 'DF-CMNet-v2',
+            'is_real_training': is_real,
+            'dataset_path': os.path.abspath(args.data_dir) if args.data_dir else 'SyntheticSmokeTest',
+            'num_train_samples': len(train_dataset),
+            'num_val_samples': len(val_dataset),
+            'crop_mode': args.crop_mode,
             'epoch': epoch,
+            'total_epochs': args.epochs,
             'variant': args.variant,
             'seed': args.seed,
             'model_state_dict': model.state_dict(),
@@ -310,13 +344,19 @@ def main():
             'f1_05': res['f1_05'],
             'iou_05': res['iou_05'],
             'auc': res['auc'],
-            'auth_fpr': res['auth_fpr']
+            'auth_fpr': res['auth_fpr'],
+            'train_loss': train_loss,
+            'val_loss': res['val_loss'],
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'device': str(device),
+            'cuda_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
         }
 
         if res['f1_05'] > best_f1:
             best_f1 = res['f1_05']
             ckpt_path = os.path.join(args.save_dir, args.ckpt_name)
             torch.save(checkpoint, ckpt_path)
+            print(f"    --> [SAVED NEW BEST] Epoch {epoch:02d}: Val F1 improved to {best_f1*100:.2f}% (Saved to {ckpt_path})")
 
     log_name = f"convergence_{args.variant}_seed{args.seed}.json" if args.variant != "V8" else "convergence_60_epochs.json"
     log_path = os.path.join(args.results_dir, log_name)

@@ -81,7 +81,8 @@ class ForensicBenchmarkSuite:
         img_size=256,
         batch_size=16,
         device=None,
-        save_dir="results"
+        save_dir="results",
+        allow_synthetic=False
     ):
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -92,23 +93,43 @@ class ForensicBenchmarkSuite:
         self.img_size = (img_size, img_size) if isinstance(img_size, int) else tuple(img_size)
         self.batch_size = batch_size
         self.save_dir = save_dir
+        self.allow_synthetic = allow_synthetic
         os.makedirs(save_dir, exist_ok=True)
 
         if model is not None:
             self.model = model.to(self.device)
         else:
+            if not checkpoint_path or not os.path.exists(checkpoint_path):
+                raise FileNotFoundError(
+                    f"\n[FATAL INTEGRITY ERROR] Model checkpoint not found at '{checkpoint_path}'!\n"
+                    f"DF-CMNet v2 refuses to run benchmark evaluations using nonexistent checkpoints or uninitialized random weights.\n"
+                    f"Actions to resolve:\n"
+                    f"  1. Train your model first using `python train.py --data_dir ./data/CASIA_v2 --save_dir checkpoints`\n"
+                    f"  2. Pass the correct checkpoint path: `python experiments/benchmark_suite.py --checkpoint checkpoints/<YOUR_MODEL>.pth`\n"
+                )
+
             self.model = DF_CMNet(variant="V8").to(self.device)
-            if checkpoint_path and os.path.exists(checkpoint_path):
-                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-                state = ckpt.get("model_state_dict", ckpt)
-                self.model.load_state_dict(state, strict=False)
-                print(f"[+] Loaded model checkpoint from {checkpoint_path}")
-            else:
-                print(f"[!] Checkpoint '{checkpoint_path}' not found; evaluating current model weights.")
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            self.model.load_state_dict(state, strict=False)
+
+            is_real = ckpt.get("is_real_training", "Unmarked") if isinstance(ckpt, dict) else "Unmarked"
+            num_samples = ckpt.get("num_train_samples", "N/A") if isinstance(ckpt, dict) else "N/A"
+            trained_ds = ckpt.get("dataset_path", "N/A") if isinstance(ckpt, dict) else "N/A"
+            epoch = ckpt.get("epoch", "N/A") if isinstance(ckpt, dict) else "N/A"
+            best_f1 = ckpt.get("best_f1", "N/A") if isinstance(ckpt, dict) else "N/A"
+
+            print("=" * 80)
+            print("[BENCHMARK ENGINE: VERIFIED CHECKPOINT LOADED]")
+            print(f"  Checkpoint Path : {os.path.abspath(checkpoint_path)}")
+            print(f"  Real Training   : {is_real}")
+            print(f"  Training Set    : {trained_ds} ({num_samples} samples)")
+            print(f"  Epoch / Best F1 : Epoch {epoch} (Val F1: {best_f1})")
+            print("=" * 80)
 
         self.model.eval()
 
-    def _get_dataset(self, ds_dir, split="test", eval_distortion=None, fallback_synthetic=False):
+    def _get_dataset(self, ds_dir, split="test", eval_distortion=None):
         if ds_dir and os.path.exists(ds_dir):
             ds = PassiveForgeryDataset(
                 root_dir=ds_dir,
@@ -121,9 +142,6 @@ class ForensicBenchmarkSuite:
             )
             if len(ds) > 0:
                 return ds
-        if fallback_synthetic:
-            print(f"[!] Dataset directory '{ds_dir}' not found; using SyntheticForgeryDataset for smoke testing.")
-            return SyntheticForgeryDataset(num_samples=40, img_size=self.img_size, is_train=False)
         return None
 
     @torch.no_grad()
@@ -247,7 +265,7 @@ class ForensicBenchmarkSuite:
 
         for name, split in dataset_specs:
             ds_path = os.path.join(self.data_root, name)
-            ds = self._get_dataset(ds_path, split=split, fallback_synthetic=False)
+            ds = self._get_dataset(ds_path, split=split)
             if ds is None or len(ds) == 0:
                 continue
             print(f"[*] Evaluating {name} ({split} split, {len(ds)} images)...")
@@ -256,13 +274,21 @@ class ForensicBenchmarkSuite:
             results[name] = metrics
             print(f"    -> {name}: F1={metrics['F1']}% | IoU={metrics['IoU']}% | AUC={metrics['AUC']}% | Auth_FPR={metrics['Auth_FPR']}%")
 
-        # Fallback if no real dataset is present on local PC yet
         if not results:
-            primary_dir = os.path.join(self.data_root, "CASIA_v2")
-            ds = self._get_dataset(primary_dir, split="test", fallback_synthetic=True)
-            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=0)
-            metrics, _ = self.evaluate_loader(loader, compute_boundary=True, compute_scale_bins=True)
-            results["Synthetic_Smoke_Test"] = metrics
+            if self.allow_synthetic:
+                print("[!] WARNING: --allow_synthetic active. Running on Synthetic dummy data for testing.")
+                ds = SyntheticForgeryDataset(num_samples=40, img_size=self.img_size, is_train=False)
+                loader = DataLoader(ds, batch_size=self.batch_size, shuffle=False, num_workers=0)
+                metrics, _ = self.evaluate_loader(loader, compute_boundary=True, compute_scale_bins=True)
+                results["Synthetic_Smoke_Test"] = metrics
+            else:
+                raise FileNotFoundError(
+                    f"\n[FATAL INTEGRITY ERROR] No benchmark datasets found under '{self.data_root}'!\n"
+                    f"Automatic fallback to synthetic data is DISABLED to prevent generating unmeasured or fake numbers.\n"
+                    f"Please download real datasets using:\n"
+                    f"  python download_datasets.py --data_root {self.data_root} --datasets CASIA_v2 Columbia COVERAGE CocoGlide\n"
+                    f"(Or pass --allow_synthetic if running dry-run unit tests on dummy data)\n"
+                )
 
         return results
 
@@ -272,7 +298,26 @@ class ForensicBenchmarkSuite:
         AWGN, Geometric Scaling/Rotation, and Social Media re-encoding pipelines.
         """
         ds_path = os.path.join(self.data_root, dataset_name)
-        use_synth = not (os.path.exists(ds_path) and len(discover_forensic_samples(ds_path)) > 0)
+        if not (os.path.exists(ds_path) and len(discover_forensic_samples(ds_path)) > 0):
+            # Check if any other real dataset exists
+            discovered = [
+                d for d in ["CASIA_v2", "Columbia", "COVERAGE", "CocoGlide", "CASIA_v1", "NIST16"]
+                if os.path.exists(os.path.join(self.data_root, d)) and len(discover_forensic_samples(os.path.join(self.data_root, d))) > 0
+            ]
+            if discovered:
+                dataset_name = discovered[0]
+                ds_path = os.path.join(self.data_root, dataset_name)
+                print(f"[*] Note: Requested robustness dataset not found, using real dataset '{dataset_name}'")
+            elif self.allow_synthetic:
+                print(f"[!] WARNING: --allow_synthetic active. Using Synthetic data for robustness suite.")
+                dataset_name = "Synthetic_Smoke_Test"
+            else:
+                raise FileNotFoundError(
+                    f"\n[FATAL INTEGRITY ERROR] Cannot run robustness suite: dataset '{dataset_name}' not found at '{ds_path}'.\n"
+                    f"No valid real forensic datasets found in '{self.data_root}'.\n"
+                )
+
+        use_synth = (dataset_name == "Synthetic_Smoke_Test")
         nw = 2 if (self.device.type == "cuda" and not use_synth) else 0
 
         def _run_condition(distortion):
@@ -292,7 +337,7 @@ class ForensicBenchmarkSuite:
             m, _ = self.evaluate_loader(loader, compute_boundary=False, compute_scale_bins=False)
             return {"F1": m["F1"], "IoU": m["IoU"], "AUC": m["AUC"], "Auth_FPR": m["Auth_FPR"]}
 
-        print(f"[*] Running Real Post-Processing Robustness Suite on {dataset_name if not use_synth else 'Synthetic_Test'}...")
+        print(f"[*] Running Real Post-Processing Robustness Suite on {dataset_name}...")
 
         jpeg_res = {}
         for qf in [100, 90, 80, 70, 60, 50, 40]:
@@ -321,7 +366,7 @@ class ForensicBenchmarkSuite:
             social_res[plat] = _run_condition(("social", plat))
 
         return {
-            "dataset_evaluated": dataset_name if not use_synth else "Synthetic_Smoke_Test",
+            "dataset_evaluated": dataset_name,
             "jpeg_robustness": jpeg_res,
             "blur_robustness": blur_res,
             "noise_robustness": noise_res,
@@ -437,6 +482,8 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=256, help="Evaluation crop/patch resolution")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--save_dir", type=str, default="results", help="Output directory for JSON results")
+    parser.add_argument("--allow_synthetic", action="store_true", default=False,
+                        help="Explicitly permit Synthetic dummy data for local dry-run unit tests ONLY. Defaults to False.")
     args = parser.parse_args()
 
     suite = ForensicBenchmarkSuite(
@@ -444,6 +491,7 @@ if __name__ == "__main__":
         data_root=args.data_root,
         img_size=args.img_size,
         batch_size=args.batch_size,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        allow_synthetic=args.allow_synthetic
     )
     suite.run_all_benchmarks()

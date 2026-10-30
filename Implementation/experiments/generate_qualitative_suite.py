@@ -94,18 +94,33 @@ def run_qualitative_inference(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = DF_CMNet(variant="V8").to(device)
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        state = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state, strict=False)
-        print(f"[+] Loaded trained checkpoint from {checkpoint_path} (pure inference mode)")
-    else:
-        print(f"[!] Warning: Checkpoint '{checkpoint_path}' not found. Using current weights.")
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"\n[FATAL INTEGRITY ERROR] Model checkpoint not found at '{checkpoint_path}'!\n"
+            f"Qualitative visualization requires a verified checkpoint from real training.\n"
+            f"Please train the model first with `python train.py --data_dir ./data/CASIA_v2`.\n"
+        )
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(state, strict=False)
+
+    is_real = ckpt.get("is_real_training", "Unmarked") if isinstance(ckpt, dict) else "Unmarked"
+    trained_ds = ckpt.get("dataset_path", "N/A") if isinstance(ckpt, dict) else "N/A"
+    epoch = ckpt.get("epoch", "N/A") if isinstance(ckpt, dict) else "N/A"
+    print("=" * 80)
+    print(f"[QUALITATIVE SUITE: VERIFIED CHECKPOINT LOADED]")
+    print(f"  Checkpoint Path : {os.path.abspath(checkpoint_path)}")
+    print(f"  Real Training   : {is_real}")
+    print(f"  Trained Source  : {trained_ds} (Epoch {epoch})")
+    print("=" * 80)
     model.eval()
 
     if not data_dir or not os.path.exists(data_dir):
-        print(f"[!] No real dataset directory provided at '{data_dir}'. Pass --data_dir ./data/CASIA_v2 on Colab.")
-        return
+        raise FileNotFoundError(
+            f"\n[FATAL INTEGRITY ERROR] Real dataset directory not found at '{data_dir}'!\n"
+            f"Held-out qualitative inference requires genuine test images (e.g., --data_dir ./data/CASIA_v2).\n"
+        )
 
     test_ds = PassiveForgeryDataset(
         root_dir=data_dir,
@@ -116,8 +131,7 @@ def run_qualitative_inference(
         simulate_jpeg=False
     )
     if len(test_ds) == 0:
-        print(f"[!] No test samples found in {data_dir}.")
-        return
+        raise ValueError(f"[FATAL INTEGRITY ERROR] No test samples found in '{data_dir}'. Check dataset structure.")
 
     # Select held-out tampered and authentic samples from the test split
     tamp_indices = [i for i, s in enumerate(test_ds.samples) if s[2] == 1]

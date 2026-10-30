@@ -12,17 +12,22 @@ env/
 venv/
 ENV/
 
-# Checkpoint full backups (only best_model.pth is tracked in git)
-**/checkpoints/*_full.pth
-**/checkpoints/*60epochs*.pth
-**/checkpoints/latest*.pth
-checkpoints/*_full.pth
-checkpoints/*60epochs*.pth
-checkpoints/latest*.pth
-Implementation/checkpoints/*_full.pth
-Implementation/checkpoints/*60epochs*.pth
-Implementation/checkpoints/latest*.pth
+# Checkpoint models (never track heavy or stale weights in git)
+*.pth
 *.pth.tar
+**/checkpoints/*.pth
+checkpoints/*.pth
+Implementation/checkpoints/*.pth
+
+# Evaluation outputs and results (generated dynamically)
+Implementation/results/*.json
+Implementation/results/*.png
+Implementation/results/*.jpg
+Implementation/results/qualitative/
+results/*.json
+results/*.png
+results/*.jpg
+results/qualitative/
 
 # LaTeX Intermediate Auxiliary Files
 *.aux
