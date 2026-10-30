@@ -19,15 +19,13 @@ DF-CMNet/
     ├── models/            # Architecture definitions (LHFRE, DACM, BARGM, DF-CMNet v2)
     ├── losses/            # Compound objective with Authentic Suppression Penalty (ASP)
     ├── dataset/           # Real benchmark loaders & on-the-fly synthetic generator
-    ├── experiments/       # Evaluation suites, qualitative generators, robustness tests
-    ├── checkpoints/       # Trained model weights (best_model.pth)
-    ├── results/           # Benchmark metrics (JSON), heatmaps, and overlays
-    ├── demo/              # Sample query images & forensic localization masks
+    ├── experiments/       # Genuine evaluation suite (benchmark_suite, generate_qualitative_suite)
+    ├── checkpoints/       # Trained model weights directory (.gitkeep)
+    ├── results/           # Benchmark metrics (JSON), heatmaps, and overlays (.gitkeep)
     ├── Colab_H100_Runner.ipynb # One-click Master Google Colab H100 execution notebook
     ├── download_datasets.py # Automated benchmark dataset downloader (Kaggle & mirrors)
     ├── train.py           # Training and validation pipeline with ablation support (V1..V8)
-    ├── train_60_epochs.py # 60-epoch training entry point
-    ├── infer.py           # Inference script with visual forensic artifact generation
+    ├── infer.py           # Single-image inference CLI with visual forensic artifact generation
     ├── verify_model.py    # Unit tests, gradient flow checks, and FLOP verification
     ├── requirements.txt   # Python dependencies
     └── README.md          # Detailed implementation documentation and quick start guide
@@ -72,7 +70,7 @@ To explore the code, train models, or run inference locally:
 cd Implementation
 pip install -r requirements.txt
 python verify_model.py
-python infer.py --image_path demo/case_splicing_query.png --checkpoint checkpoints/best_model.pth
+python train.py --data_dir ./data/CASIA_v2 --epochs 60 --batch_size 32 --amp
 ```
 
 For full setup, training instructions, and ablation experiments, see [Implementation/README.md](Implementation/README.md).

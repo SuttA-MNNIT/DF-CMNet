@@ -1,18 +1,18 @@
-# DF-CMNet: Dual-Domain Frequency-Spatial Cross-Modulation Network for Passive Image Forgery Localization
+# DF-CMNet v2: Dual-Domain Frequency-Spatial Cross-Modulation Network for Passive Image Forgery Localization
 
-An open-source PyTorch implementation of **DF-CMNet**, an end-to-end deep learning framework designed for passive (blind) image forgery detection and pixel-level localization across various manipulation types (splicing, copy-move cloning, and generative inpainting).
+An open-source PyTorch implementation of **DF-CMNet v2**, an end-to-end deep learning framework designed for passive (blind) image forgery detection and pixel-level localization across various manipulation types (splicing, copy-move cloning, and generative inpainting).
 
 ---
 
 ## 🌟 Key Architecture & Highlights
 
-DF-CMNet resolves structural bottlenecks in passive image forensics (such as semantic edge bias, cross-domain decoupling, and vanishing gradients on authentic images) through a coordinated dual-stream design:
+DF-CMNet v2 resolves structural bottlenecks in passive image forensics (such as semantic edge bias, cross-domain decoupling, and vanishing gradients on authentic images) through a coordinated dual-stream design:
 
 1. **Learnable High-Frequency Residual Extractor (LHFRE):**
    - Integrates Bayar constrained convolution kernels to suppress semantic content and extract low-level sensor noise footprints (PRNU, demosaicing artifacts).
    - Decomposes residuals into directional frequency sub-bands ($LH, HL, HH$) via multi-scale 2D Discrete Wavelet Transform (2D-DWT).
 
-2. **Cross-Domain Bidirectional Modulation (CDBM / DACM):**
+2. **Dual-Attention Cross-Domain Modulation (DACM / CDBM):**
    - Coordinates reciprocal spatial and channel cross-attention between spatial representations and spectral sub-bands.
    - Selectively recalibrates spatial representations using high-frequency anomaly cues and vice versa.
 
@@ -21,7 +21,7 @@ DF-CMNet resolves structural bottlenecks in passive image forensics (such as sem
    - Enforces sharp localization along blended or feathered manipulation margins.
 
 4. **Compound Multi-Task Objective with Authentic Suppression Penalty (ASP):**
-   - Jointly optimizes Focal Loss, Soft Dice Loss, and morphological boundary supervision.
+   - Jointly optimizes Focal Loss, Soft-IoU / Dice, and morphological boundary supervision.
    - Integrates an authentic suppression penalty that completely prevents zero-gradient pathologies on negative pristine imagery.
 
 ---
@@ -39,26 +39,24 @@ DF-CMNet resolves structural bottlenecks in passive image forensics (such as sem
 │
 ├── losses/                      # Loss formulations
 │   ├── __init__.py
-│   └── compound_loss.py         # Multi-task loss: Focal Loss + Regime-Decoupled Soft-IoU + ASP + Boundary BCE
+│   └── compound_loss.py         # Multi-task loss: Focal Loss + Soft-IoU + ASP + Boundary BCE
 │
 ├── dataset/                     # Data loading & augmentation
 │   ├── __init__.py
 │   ├── forgery_dataset.py       # Real benchmark loader (auto-discovers CASIA, Columbia, COVERAGE, IMD2020)
-│   └── synthetic_tamper.py      # On-the-fly synthetic tamper generator for local CPU smoke testing
+│   └── synthetic_tamper.py      # Synthetic tamper generator for dry-run unit tests
 │
 ├── experiments/                 # Comprehensive evaluation & visualization suite
 │   ├── benchmark_suite.py       # Real multi-benchmark evaluation suite (Hausdorff 95, GFLOPs, robustness)
 │   └── generate_qualitative_suite.py # Zero-leakage qualitative & robustness visual generator
 │
-├── checkpoints/                 # Model checkpoints directory
-├── demo/                        # Sample test imagery & ground-truth masks
-├── results/                     # Evaluation metrics, JSON logs, & qualitative heatmaps
-├── Colab_H100_Runner.ipynb      # One-click Master Google Colab H100 / A100 execution notebook
+├── checkpoints/                 # Model checkpoints directory (.gitkeep)
+├── results/                     # Evaluation metrics, JSON logs, & qualitative heatmaps (.gitkeep)
+├── Colab_H100_Runner.ipynb      # Master Google Colab H100 / A100 execution notebook
 ├── download_datasets.py         # Automated Kagglehub & mirror benchmark dataset downloader
 ├── verify_model.py              # Unit tests, gradient flow checks, and throughput benchmarking
 ├── train.py                     # Mixed-precision training pipeline with ablation switches (V1..V8)
-├── train_60_epochs.py           # 60-epoch full training entry point
-├── infer.py                     # Inference script producing heatmaps, masks, and boundary overlays
+├── infer.py                     # Single-image inference CLI producing heatmaps, masks, and boundary overlays
 ├── requirements.txt             # Environment dependencies
 ├── LICENSE                      # MIT License
 └── README.md                    # Project documentation
@@ -84,12 +82,11 @@ pip install -r requirements.txt
 
 ## 🚀 Quick Start Guide
 
-### 1. One-Click Google Colab Execution (H100 / A100 / T4)
-For fast GPU training and evaluation without manual setup, open `Colab_H100_Runner.ipynb` directly in Google Colab:
-1. Upload the `Implementation/` folder (or clone from GitHub) to your Google Drive / Colab environment.
-2. Open `Colab_H100_Runner.ipynb` in Colab.
-3. Select an H100, A100, or T4 GPU runtime.
-4. Run all cells sequentially.
+### 1. Google Colab Execution (H100 / A100 / T4)
+For complete end-to-end training and evaluation, open `Colab_H100_Runner.ipynb` in Google Colab:
+1. Open `Colab_H100_Runner.ipynb` in Colab.
+2. Select an H100 or A100 GPU runtime.
+3. Run all cells sequentially.
 
 ---
 
@@ -100,53 +97,65 @@ Run the automated verification suite to test forward pass, backward pass, gradie
 python verify_model.py
 ```
 
-### 2. Run Inference & Tampering Localization
-Localize tampering on any test image and generate visual forensic artifacts (probability heatmaps, binary masks, boundary maps, and overlaid masks):
+---
 
+### 3. Training DF-CMNet v2
+
+To train on a real forensic benchmark dataset (e.g. CASIA v2.0):
 ```bash
-python infer.py --image_path demo/case_splicing_query.png --checkpoint checkpoints/best_model.pth --img_size 256
+python train.py \
+    --data_dir ./data/CASIA_v2 \
+    --variant V8 \
+    --epochs 60 \
+    --batch_size 32 \
+    --lr 1e-4 \
+    --img_size 256 \
+    --crop_mode native \
+    --amp \
+    --save_dir checkpoints \
+    --ckpt_name colab_h100_best_model.pth
 ```
 
-If no `--image_path` is specified, the script automatically synthesizes a demo tampered image and performs localization.
+---
 
-**Generated Forensic Artifacts (saved in `results/`):**
-- `*_prob_heatmap.png`: Continuous tampering confidence heatmap $[0, 1]$.
+### 4. Experimental Benchmarks & Evaluation
+
+Run the automated evaluation benchmark suite:
+```bash
+python experiments/benchmark_suite.py \
+    --data_root ./data \
+    --checkpoint checkpoints/colab_h100_best_model.pth \
+    --img_size 256 \
+    --batch_size 32 \
+    --save_dir results
+```
+
+Generate held-out qualitative diagnostic visual panels:
+```bash
+python experiments/generate_qualitative_suite.py \
+    --checkpoint checkpoints/colab_h100_best_model.pth \
+    --data_dir ./data/CASIA_v2 \
+    --output_dir results/qualitative \
+    --num_cases 8
+```
+
+---
+
+### 5. Single-Image Inference
+Localize tampering on any test image and generate visual forensic artifacts:
+
+```bash
+python infer.py \
+    --image_path ./data/CASIA_v2/Tp/example.jpg \
+    --checkpoint checkpoints/colab_h100_best_model.pth \
+    --output_dir results/inference
+```
+
+**Generated Forensic Artifacts (saved in `results/inference/`):**
+- `*_prob_heatmap.png`: Continuous tampering confidence heatmap $[0, 1]$ (Jet colormap).
 - `*_binary_mask.png`: Binarized tampering decision mask.
 - `*_boundary_map.png`: Localized boundary transition seams.
-- `*_overlay.png`: Visual forensic heatmap blended over the original image.
-
----
-
-## 🏋️ Training DF-CMNet
-
-### Train on Synthetic Tampering Data (Out-of-the-Box)
-You can train immediately on synthetic tampering data without downloading external datasets:
-
-```bash
-python train.py --epochs 10 --batch_size 4 --img_size 256
-```
-
-### Train on Benchmark Datasets
-Format your dataset (e.g., CASIA v2.0, Columbia, NIST'16, or COVERAGE) into `images/` and `masks/`:
-
-```bash
-python train.py --data_dir /path/to/dataset --epochs 50 --batch_size 16 --img_size 512
-```
-
----
-
-## 📊 Experimental Evaluation Suite
-
-Run the automated evaluation benchmark suite covering intra-dataset localization, cross-dataset transferability, tamper scale sensitivity, and degradation stress-testing (JPEG re-compression, Gaussian blur, additive noise, geometric transformations):
-
-```bash
-python experiments/benchmark_suite.py
-```
-
-Generate visual forensic comparison plates:
-```bash
-python experiments/generate_qualitative_suite.py
-```
+- `*_overlay.png`: Visual forensic heatmap blended over the original query image.
 
 ---
 

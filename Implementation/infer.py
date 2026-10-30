@@ -1,106 +1,141 @@
+"""
+Single-Image Forensic Inference CLI for DF-CMNet v2.
+
+Runs pure forward inference on an input test image and exports:
+  1. Continuous tampering probability heatmap (Jet colormap)
+  2. Binarized localization mask (tau threshold)
+  3. BARGM boundary transition seam map
+  4. Visual forensic contour overlay on the original query image
+
+Usage:
+  python infer.py --image_path ./data/CASIA_v2/Tp/example.jpg --checkpoint checkpoints/colab_h100_best_model.pth --output_dir results/inference
+"""
+
 import os
 import argparse
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 import torchvision.transforms.functional as TF
 
 from models import DF_CMNet
-from dataset.synthetic_tamper import SyntheticForgeryDataset
 
-def run_inference(model, image_path, output_dir="results", img_size=(512, 512), threshold=0.5, device="cpu"):
+
+def apply_jet_colormap(prob_2d):
+    """Maps a 2D probability array in [0, 1] to an RGB heatmap (uint8 [H, W, 3])."""
+    v = np.clip(prob_2d, 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * v - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * v - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * v - 1.0), 0.0, 1.0)
+    rgb = np.stack([r, g, b], axis=-1)
+    return (rgb * 255.0).astype(np.uint8)
+
+
+def create_forensic_overlay(orig_img, bin_mask_2d):
+    """Blends predicted tampering region and boundary contour over original RGB image."""
+    base = np.array(orig_img.convert("RGB"), dtype=np.float32)
+    mask_bool = bin_mask_2d > 0.5
+
+    mask_img = Image.fromarray((mask_bool.astype(np.uint8) * 255))
+    dil = np.array(mask_img.filter(ImageFilter.MaxFilter(5))) > 127
+    ero = np.array(mask_img.filter(ImageFilter.MinFilter(5))) > 127
+    contour = dil & (~ero)
+
+    overlay = base.copy()
+    overlay[mask_bool, 0] = 0.65 * overlay[mask_bool, 0] + 0.35 * 40.0
+    overlay[mask_bool, 1] = 0.65 * overlay[mask_bool, 1] + 0.35 * 220.0
+    overlay[mask_bool, 2] = 0.65 * overlay[mask_bool, 2] + 0.35 * 80.0
+
+    overlay[contour, 0] = 20.0
+    overlay[contour, 1] = 255.0
+    overlay[contour, 2] = 60.0
+
+    return Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
+
+
+def run_inference(model, image_path, output_dir="results/inference", img_size=(256, 256), threshold=0.5, device="cpu"):
     os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    # Load and preprocess
-    orig_img = Image.open(image_path).convert('RGB')
+    orig_img = Image.open(image_path).convert("RGB")
     orig_w, orig_h = orig_img.size
-    
+
     resized_img = orig_img.resize(img_size, Image.BILINEAR)
     img_tensor = TF.to_tensor(resized_img).unsqueeze(0).to(device)
 
     model.eval()
     with torch.no_grad():
         outputs = model(img_tensor)
-        mask_pred = outputs['mask_pred'].squeeze().cpu().numpy() # [H, W]
-        edge_pred = outputs['edge_pred'].squeeze().cpu().numpy() # [H, W]
+        mask_pred = outputs["mask_pred"].squeeze().float().cpu().numpy()
+        edge_pred = outputs["edge_pred"].squeeze().float().cpu().numpy()
 
-    # Resize predictions back to original image dimensions
-    mask_img = Image.fromarray((mask_pred * 255).astype(np.uint8)).resize((orig_w, orig_h), Image.BILINEAR)
-    edge_img = Image.fromarray((edge_pred * 255).astype(np.uint8)).resize((orig_w, orig_h), Image.BILINEAR)
+    # Bilinear interpolate predicted maps back to original resolution
+    mask_full = np.array(Image.fromarray(mask_pred).resize((orig_w, orig_h), Image.BILINEAR))
+    edge_full = np.array(Image.fromarray(edge_pred).resize((orig_w, orig_h), Image.BILINEAR))
+    bin_mask = (mask_full >= threshold).astype(np.float32)
 
-    # Binary mask
-    mask_np = np.array(mask_img) / 255.0
-    bin_mask = ((mask_np > threshold) * 255).astype(np.uint8)
-    bin_mask_img = Image.fromarray(bin_mask)
+    # Save output artifacts
+    heatmap_pil = Image.fromarray(apply_jet_colormap(mask_full))
+    bin_mask_pil = Image.fromarray((bin_mask * 255).astype(np.uint8))
+    boundary_pil = Image.fromarray(apply_jet_colormap(edge_full))
+    overlay_pil = create_forensic_overlay(orig_img, bin_mask)
 
-    # Create overlay visualization (red mask overlay on original image)
-    orig_np = np.array(orig_img).astype(np.float32)
-    overlay_np = orig_np.copy()
-    tampered_indices = mask_np > threshold
-    # Blend with red: [255, 0, 0]
-    overlay_np[tampered_indices, 0] = overlay_np[tampered_indices, 0] * 0.4 + 255 * 0.6
-    overlay_np[tampered_indices, 1] = overlay_np[tampered_indices, 1] * 0.4
-    overlay_np[tampered_indices, 2] = overlay_np[tampered_indices, 2] * 0.4
-    overlay_img = Image.fromarray(np.clip(overlay_np, 0, 255).astype(np.uint8))
+    p_heatmap = os.path.join(output_dir, f"{base_name}_prob_heatmap.png")
+    p_bin = os.path.join(output_dir, f"{base_name}_binary_mask.png")
+    p_edge = os.path.join(output_dir, f"{base_name}_boundary_map.png")
+    p_overlay = os.path.join(output_dir, f"{base_name}_overlay.png")
 
-    # Save outputs
-    heatmap_path = os.path.join(output_dir, f"{base_name}_prob_heatmap.png")
-    bin_path = os.path.join(output_dir, f"{base_name}_binary_mask.png")
-    edge_path = os.path.join(output_dir, f"{base_name}_boundary_map.png")
-    overlay_path = os.path.join(output_dir, f"{base_name}_overlay.png")
+    heatmap_pil.save(p_heatmap)
+    bin_mask_pil.save(p_bin)
+    boundary_pil.save(p_edge)
+    overlay_pil.save(p_overlay)
 
-    mask_img.save(heatmap_path)
-    bin_mask_img.save(bin_path)
-    edge_img.save(edge_path)
-    overlay_img.save(overlay_path)
+    tampered_ratio = float(np.mean(bin_mask)) * 100.0
+    print(f"\n[+] Forensic Localization Results for: {image_path}")
+    print(f"  Dimensions         : {orig_w} x {orig_h}")
+    print(f"  Tampered Coverage  : {tampered_ratio:.2f}% of pixels (tau={threshold})")
+    print(f"  Artifacts saved to : {os.path.abspath(output_dir)}")
+    print(f"    - Heatmap        : {p_heatmap}")
+    print(f"    - Binary Mask    : {p_bin}")
+    print(f"    - Boundary Seams : {p_edge}")
+    print(f"    - Visual Overlay : {p_overlay}")
 
-    print(f"[+] Inference complete for: {image_path}")
-    print(f"  - Probability Heatmap: {heatmap_path}")
-    print(f"  - Binary Mask:        {bin_path}")
-    print(f"  - Boundary Map:       {edge_path}")
-    print(f"  - Tamper Overlay:     {overlay_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference with DF-CMNet")
-    parser.add_argument("--image_path", type=str, default=None, help="Path to input image to test")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained checkpoint (.pth)")
-    parser.add_argument("--output_dir", type=str, default="results", help="Directory to save output masks")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Tampering detection threshold")
-    parser.add_argument("--img_size", type=int, default=512, help="Inference resolution")
+    parser = argparse.ArgumentParser(description="Run DF-CMNet v2 Forensic Inference")
+    parser.add_argument("--image_path", type=str, required=True, help="Path to input test image")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint (.pth)")
+    parser.add_argument("--output_dir", type=str, default="results/inference", help="Directory to save output masks")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Tampering detection threshold (default: 0.5)")
+    parser.add_argument("--img_size", type=int, default=256, help="Inference resolution (default: 256)")
     args = parser.parse_args()
 
+    if not os.path.exists(args.image_path):
+        raise FileNotFoundError(f"[FATAL] Test image '{args.image_path}' not found!")
+
+    if not os.path.exists(args.checkpoint):
+        raise FileNotFoundError(f"[FATAL] Model checkpoint '{args.checkpoint}' not found!")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Running inference on device: {device}")
+    print(f"[*] Initializing DF-CMNet v2 on {device}...")
+    model = DF_CMNet(variant="V8").to(device)
 
-    # Load model
-    model = DF_CMNet(pretrained=False).to(device)
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"[*] Loading model weights from: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-        else:
-            model.load_state_dict(ckpt)
-    else:
-        print("[!] Warning: No checkpoint specified. Running with initialized weights.")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(state, strict=False)
 
-    # Image selection
-    if args.image_path and os.path.exists(args.image_path):
-        test_path = args.image_path
-    else:
-        # Generate a demo synthetic tampered image
-        print("[*] No test image specified. Generating a synthetic tampered image demo...")
-        os.makedirs("demo", exist_ok=True)
-        syn_dataset = SyntheticForgeryDataset(num_samples=1, img_size=(args.img_size, args.img_size))
-        img_tensor, mask_tensor, fname = syn_dataset[0]
-        test_path = os.path.join("demo", "test_tampered_sample.png")
-        TF.to_pil_image(img_tensor).save(test_path)
-        TF.to_pil_image(mask_tensor).save(os.path.join("demo", "ground_truth_mask.png"))
-        print(f"[*] Demo image saved to {test_path}")
+    if isinstance(ckpt, dict) and ckpt.get("is_real_training"):
+        print(f"[✓] Checkpoint Provenance: Trained on {ckpt.get('num_train_samples')} real samples from {ckpt.get('dataset_path')}")
 
-    run_inference(model, test_path, output_dir=args.output_dir, 
-                  img_size=(args.img_size, args.img_size), threshold=args.threshold, device=device)
+    run_inference(
+        model=model,
+        image_path=args.image_path,
+        output_dir=args.output_dir,
+        img_size=(args.img_size, args.img_size),
+        threshold=args.threshold,
+        device=device
+    )
+
 
 if __name__ == "__main__":
     main()
